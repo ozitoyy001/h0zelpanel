@@ -40,11 +40,13 @@ if (isNaN(PORT) || PORT < 1 || PORT > 65535) {
 // P12 — chemin pm2 configurable pour éviter ENOENT si PATH absent
 const PM2_BIN = process.env.PM2_BIN || 'pm2';
 
-// Trust proxy configurable (pour reverse proxy)
-const TRUST_PROXY = process.env.TRUST_PROXY || false;
-if (TRUST_PROXY) {
-  app.set('trust proxy', TRUST_PROXY);
-}
+// C1 — trust proxy : valeur normalisée ICI, mais appliquée APRÈS `const app = express()`
+//      (avant : app.set() référençait app avant sa déclaration → ReferenceError au boot)
+//      '0' / 'false' / vide → désactivé ; '1' / 'true' → 1 ; sinon valeur brute ('loopback'…)
+const TP_RAW = process.env.TRUST_PROXY;
+const TRUST_PROXY = (!TP_RAW || TP_RAW === '0' || TP_RAW === 'false')
+  ? false
+  : (TP_RAW === '1' || TP_RAW === 'true') ? 1 : TP_RAW;
 
 // ── Config utilisateur (.env) ──
 const SERVER_NAME = process.env.SERVER_NAME || os.hostname();
@@ -64,12 +66,13 @@ function detectOsName() {
 // Crédits / liens (configurables pour distribution)
 const GITHUB_USER = 'ozitoyy001';
 const GITHUB_REPO = 'https://github.com/ozitoyy001/h0zelpanel';
-const APP_VERSION = '1.0.0';
+// Version unique : lue depuis package.json (plus jamais désynchronisée)
+const APP_VERSION = require('./package.json').version;
 
 
-// P1 — secret de session stable dérivé du mot de passe
-//       (survit aux redémarrages, ne change que si le mdp change)
-const SESSION_SECRET = crypto.createHash('sha256').update(PASSWORD).digest('hex');
+// B7 — le secret de session n'est PLUS dérivé du mot de passe :
+//      un secret aléatoire est généré au premier boot et persisté dans data.json
+//      (voir plus bas, après le chargement de DATA)
 
 // ─────────────────────────────────────────────
 //  PERSISTANCE (data.json, écriture atomique)
@@ -97,18 +100,30 @@ function scheduleSave() {
     saveTimer = null;
     if (!dirty) return;
     dirty = false;
-    try {
-      const tmp = DATA_FILE + '.tmp';
-      fs.writeFileSync(tmp, JSON.stringify(DATA, null, 2));
-      fs.renameSync(tmp, DATA_FILE);
-      fs.chmodSync(DATA_FILE, 0o600); // restrict permissions
-      return true;
-    } catch (e) {
-      console.error('[saveData]', e.message);
-      return false;
-    }
+    try { writeDataSync(); }
+    catch (e) { console.error('[saveData]', e.message); }
   }, 800); // throttled
 }
+
+// Écriture atomique partagée (debounce + flush)
+function writeDataSync() {
+  const tmp = DATA_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(DATA, null, 2));
+  fs.renameSync(tmp, DATA_FILE);
+  fs.chmodSync(DATA_FILE, 0o600); // restrict permissions
+}
+
+// C4 — flush synchrone à l'arrêt : sans ça, le debounce de 800 ms peut perdre
+//      un changement de mot de passe / PIN / whitelist sur un `pm2 restart` rapide
+function flushSync() {
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  if (!dirty) return;
+  dirty = false;
+  try { writeDataSync(); }
+  catch (e) { console.error('[flushSync]', e.message); }
+}
+process.on('SIGINT',  () => { flushSync(); process.exit(0); });
+process.on('SIGTERM', () => { flushSync(); process.exit(0); });
 let DATA = loadData();
 // Compat : garantit les champs même sur un ancien data.json
 DATA.pinHash       = DATA.pinHash       || null;
@@ -118,22 +133,35 @@ DATA.bruteWindowMin= DATA.bruteWindowMin|| 15;
 DATA.logins        = DATA.logins        || [];
 DATA.audit         = DATA.audit         || [];
 
+// B7 — secret de session aléatoire, persistant, indépendant du mot de passe
+//      (avant : sha256(PANEL_PASSWORD) → entropie plafonnée par le mdp,
+//       et le secret restait celui de l'ancien .env après un changement via l'UI)
+if (!DATA.sessionSecret) {
+  DATA.sessionSecret = crypto.randomBytes(32).toString('hex');
+  saveData(DATA);
+}
+const SESSION_SECRET = DATA.sessionSecret;
+
+// C3 — scrypt ASYNC : scryptSync bloquait l'event loop ~50-100 ms par appel,
+//      sur un endpoint non authentifié (/login) = vecteur de DoS trivial
+const scryptAsync = require('util').promisify(crypto.scrypt);
+
 // Hachage scrypt (sel + clé) pour le mot de passe stocké
-function hashPassword(pw) {
+async function hashPassword(pw) {
   const salt = crypto.randomBytes(16).toString('hex');
-  const key  = crypto.scryptSync(pw, salt, 32).toString('hex');
+  const key  = (await scryptAsync(pw, salt, 32)).toString('hex');
   return salt + ':' + key;
 }
-function verifyPassword(pw, stored) {
+async function verifyPassword(pw, stored) {
   if (!stored || !stored.includes(':')) return false;
   const [salt, key] = stored.split(':');
-  const test = crypto.scryptSync(pw, salt, 32).toString('hex');
+  const test = (await scryptAsync(pw, salt, 32)).toString('hex');
   const a = Buffer.from(key, 'hex'), b = Buffer.from(test, 'hex');
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 // Vérifie un mot de passe : hash stocké si présent, sinon .env (compat)
-function checkPassword(pw) {
+async function checkPassword(pw) {
   if (DATA.passwordHash) return verifyPassword(pw, DATA.passwordHash);
   return safeCompare(pw, PASSWORD);
 }
@@ -157,7 +185,9 @@ function logLogin(ip, ok) {
 // ─────────────────────────────────────────────
 const app = express();
 
-// Trust proxy configurable (pour reverse proxy) — placé plus haut
+// C1 — trust proxy appliqué ici, app existe désormais
+if (TRUST_PROXY !== false) app.set('trust proxy', TRUST_PROXY);
+
 // R1+R2 — headers sécurité (clickjacking, MIME sniffing, CSP basique)
 app.use((req, res, next) => {
   res.setHeader('X-Frame-Options', 'DENY');
@@ -186,10 +216,13 @@ app.use(session({
 const attempts = new Map();
 
 // P5 — nettoyage automatique toutes les 5 min
+// B1 — la purge respecte la fenêtre CONFIGURÉE (avant : 15 min en dur,
+//      ce qui annulait toute fenêtre réglée au-delà dans l'UI)
 setInterval(() => {
   const now = Date.now();
+  const windowMs = DATA.bruteWindowMin * 60 * 1000;
   for (const [ip, a] of attempts) {
-    if (now - a.first > 15 * 60 * 1000) attempts.delete(ip);
+    if (now - a.first > windowMs) attempts.delete(ip);
   }
 }, 5 * 60 * 1000).unref(); // .unref() : ne bloque pas l'arrêt propre
 
@@ -217,9 +250,16 @@ function safeCompare(a, b) {
   return crypto.timingSafeEqual(ha, hb);
 }
 
+// B3 — normalise les IPv4 mappées IPv6 (::ffff:192.168.1.10 → 192.168.1.10)
+//      sinon une IP saisie à la main dans la whitelist ne matche jamais req.ip
+function normIp(ip) {
+  return String(ip || '').replace(/^::ffff:/i, '');
+}
+
 // Nettoie les IPs pour éviter XSS
 function cleanIp(ip) {
   if (!ip || typeof ip !== 'string') return '?';
+  ip = normIp(ip);
   return /^[0-9a-fA-F:.]+$/.test(ip) ? ip : '?';
 }
 
@@ -276,6 +316,12 @@ function pm2cmd(args) {
   });
 }
 
+// Tolère les notices pm2 (ex. "[PM2] update available") imprimées AVANT le JSON
+function parseJlist(raw) {
+  const i = raw.indexOf('[');
+  return JSON.parse(i > 0 ? raw.slice(i) : raw);
+}
+
 // ─────────────────────────────────────────────
 //  VALIDATION DES INPUTS
 // ─────────────────────────────────────────────
@@ -298,30 +344,31 @@ function isSafeLogPath(p) {
 //  ROUTES
 // ─────────────────────────────────────────────
 
-// Vérifie PIN (scrypt) si configuré
-function checkPin(pin) {
+// Vérifie PIN (scrypt) si configuré — async (C3)
+async function checkPin(pin) {
   if (!DATA.pinHash) return true;            // pas de PIN défini → ok
   return verifyPassword(pin || '', DATA.pinHash);
 }
 
 // Middleware whitelist IP (garde-fou : vide = tout autorisé)
+// B3 — comparaison sur IPs normalisées des deux côtés
 function ipAllowed(ip) {
   if (!DATA.ipWhitelist || !DATA.ipWhitelist.length) return true;
-  return DATA.ipWhitelist.includes(ip);
+  return DATA.ipWhitelist.map(normIp).includes(normIp(ip));
 }
 
 app.get('/login', (req, res) => res.send(loginHtml('', !!DATA.pinHash)));
 
-app.post('/login', (req, res) => {
-  const ip = req.ip;
+app.post('/login', async (req, res) => {
+  const ip = normIp(req.ip);
   // Garde-fou whitelist : on bloque AVANT toute auth
   if (!ipAllowed(ip)) {
     logLogin(ip, false);
-    return res.status(403).send(loginHtml('IP non autorisée (' + ip + ').', !!DATA.pinHash));
+    return res.status(403).send(loginHtml('IP non autorisée (' + cleanIp(ip) + ').', !!DATA.pinHash));
   }
   if (tooMany(ip)) return res.status(429).send(loginHtml('Trop de tentatives. Réessaie plus tard.', !!DATA.pinHash));
-  const okPw  = req.body.password && checkPassword(req.body.password);
-  const okPin = checkPin(req.body.pin);
+  const okPw  = !!req.body.password && await checkPassword(req.body.password);
+  const okPin = await checkPin(req.body.pin);
   if (okPw && okPin) {
     req.session.regenerate((err) => {
       if (err) {
@@ -329,6 +376,7 @@ app.post('/login', (req, res) => {
         return res.status(500).send(loginHtml('Erreur session.', !!DATA.pinHash));
       }
       req.session.ok = true;
+      attempts.delete(ip); // reset du compteur après un login réussi
       logLogin(ip, true);
       res.redirect('/');
     });
@@ -339,17 +387,22 @@ app.post('/login', (req, res) => {
   res.status(401).send(loginHtml('Identifiants incorrects.', !!DATA.pinHash));
 });
 
-app.post('/logout', auth, (req, res) =>
+app.post('/logout', auth, checkOrigin, (req, res) =>
   req.session.destroy(() => res.redirect('/login'))
 );
 
 // ─── Compte / sécurité (Vague 2) ──────────────
 // Changer le mot de passe (vérifie l'ancien, stocke le hash dans data.json)
-app.post('/api/account/password', auth, checkOrigin, (req, res) => {
+app.post('/api/account/password', auth, checkOrigin, async (req, res) => {
+  const ip = normIp(req.ip);
+  if (tooMany(ip)) return res.status(429).json({ error: 'trop de tentatives' });
   const { current, next } = req.body;
-  if (!checkPassword(current || '')) return res.status(403).json({ error: 'mot de passe actuel incorrect' });
+  if (!(await checkPassword(current || ''))) {
+    recordAttempt(ip); // B2 — le step-up compte comme une tentative
+    return res.status(403).json({ error: 'mot de passe actuel incorrect' });
+  }
   if (!next || String(next).length < 12) return res.status(400).json({ error: '12 caracteres minimum' });
-  DATA.passwordHash = hashPassword(String(next));
+  DATA.passwordHash = await hashPassword(String(next));
   saveData(DATA);
   audit('changement mot de passe', req.ip);
   res.json({ ok: true });
@@ -373,19 +426,24 @@ app.get('/api/account/security', auth, (req, res) => {
   res.json({
     pinSet: !!DATA.pinHash,
     whitelist: DATA.ipWhitelist || [],
-    currentIp: req.ip,
+    currentIp: normIp(req.ip),
     bruteMax: DATA.bruteMax,
     bruteWindowMin: DATA.bruteWindowMin,
   });
 });
 
 // Définir / retirer le PIN
-app.post('/api/account/pin', auth, checkOrigin, (req, res) => {
+app.post('/api/account/pin', auth, checkOrigin, async (req, res) => {
+  const ip = normIp(req.ip);
+  if (tooMany(ip)) return res.status(429).json({ error: 'trop de tentatives' });
   const { pin, current } = req.body;
-  if (!checkPassword(current || '')) return res.status(403).json({ error: 'mot de passe requis' });
+  if (!(await checkPassword(current || ''))) {
+    recordAttempt(ip); // B2
+    return res.status(403).json({ error: 'mot de passe requis' });
+  }
   if (!pin) { DATA.pinHash = null; saveData(DATA); audit('PIN retiré', req.ip); return res.json({ ok: true, pinSet: false }); }
   if (!/^\d{4,8}$/.test(String(pin))) return res.status(400).json({ error: 'PIN : 4 à 8 chiffres' });
-  DATA.pinHash = hashPassword(String(pin));
+  DATA.pinHash = await hashPassword(String(pin));
   saveData(DATA);
   audit('PIN défini', req.ip);
   res.json({ ok: true, pinSet: true });
@@ -394,9 +452,11 @@ app.post('/api/account/pin', auth, checkOrigin, (req, res) => {
 // Whitelist IP (garde-fou : on force l'inclusion de l'IP courante)
 app.post('/api/account/whitelist', auth, checkOrigin, (req, res) => {
   let list = Array.isArray(req.body.ips) ? req.body.ips : [];
-  list = list.map(s => String(s).trim()).filter(Boolean).slice(0, 20);
+  // B3 — normalisation au stockage (cohérent avec ipAllowed)
+  list = list.map(s => normIp(String(s).trim())).filter(Boolean).slice(0, 20);
   // GARDE-FOU anti-lockout : si la liste est non vide, l'IP courante DOIT y être
-  if (list.length && !list.includes(req.ip)) list.push(req.ip);
+  const cur = normIp(req.ip);
+  if (list.length && !list.includes(cur)) list.push(cur);
   DATA.ipWhitelist = list;
   saveData(DATA);
   audit('whitelist IP modifiée', req.ip);
@@ -418,7 +478,7 @@ app.post('/api/account/brute', auth, checkOrigin, (req, res) => {
 app.get('/api/status', auth, async (req, res) => {
   try {
     const raw  = await pm2cmd(['jlist']);
-    const list = JSON.parse(raw).map(p => ({
+    const list = parseJlist(raw).map(p => ({
       name:     p.name,
       status:   p.pm2_env.status,
       cpu:      p.monit ? p.monit.cpu : 0,
@@ -455,7 +515,7 @@ app.get('/api/logs/:name', auth, async (req, res) => {
 
   try {
     const raw  = await pm2cmd(['jlist']);
-    const proc = JSON.parse(raw).find(p => p.name === name);
+    const proc = parseJlist(raw).find(p => p.name === name);
     if (!proc) return res.status(404).json({ error: 'process introuvable' });
 
     // P15 — validation des chemins de log
@@ -485,7 +545,10 @@ app.get('/api/logs/:name', auth, async (req, res) => {
 
 // API : actions sur les process (start/stop/restart)
 // P11 — checkOrigin ajouté
-app.post('/api/:action/:name', auth, checkOrigin, async (req, res) => {
+// C5 — route contrainte à (start|stop|restart) : avant, déclarée en premier,
+//      elle interceptait AUSSI /api/sysaction/reboot etc. (action='sysaction')
+//      → toutes les actions système renvoyaient 400 "action inconnue"
+app.post('/api/:action(start|stop|restart)/:name', auth, checkOrigin, async (req, res) => {
   const { action, name } = req.params;
   if (!ACTIONS.has(action)) return res.status(400).json({ error: 'action inconnue' });
   if (!NAME_RE.test(name))  return res.status(400).json({ error: 'nom invalide' });
@@ -507,7 +570,7 @@ app.get('/logs/:name', auth, async (req, res) => {
 
   try {
     const raw  = await pm2cmd(['jlist']);
-    const proc = JSON.parse(raw).find(p => p.name === name);
+    const proc = parseJlist(raw).find(p => p.name === name);
     if (!proc) return res.status(404).send('process introuvable');
 
     const logPath = tab === 'err'
@@ -569,10 +632,12 @@ const SYS_SERVICES = {
 };
 
 // Actions système ponctuelles (boutons, pas toggles)
+// C2 — `sysctl vm.drop_caches=3` SANS `-w` : la règle sudoers du README matche
+//      les arguments à l'exact, et `-w` est implicite avec la syntaxe clé=valeur
 const SYS_ACTIONS = {
   reboot:    ['reboot'],
   poweroff:  ['poweroff'],
-  dropcache: ['sysctl', '-w', 'vm.drop_caches=3'],
+  dropcache: ['sysctl', 'vm.drop_caches=3'],
   ntpsync:   ['systemctl', 'restart', 'systemd-timesyncd'],
 };
 
@@ -613,7 +678,10 @@ app.post('/api/sys/:service/:state', auth, checkOrigin, async (req, res) => {
   if (state !== 'on' && state !== 'off') return res.status(400).json({ error: 'etat invalide' });
 
   if (service === 'ufw' && state === 'off') {
-    if (!checkPassword(req.body.confirm || '')) {
+    const ip = normIp(req.ip);
+    if (tooMany(ip)) return res.status(429).json({ error: 'trop de tentatives' });
+    if (!(await checkPassword(req.body.confirm || ''))) {
+      recordAttempt(ip); // B2 — pas de bruteforce du mdp via le step-up
       return res.status(403).json({ error: 'mot de passe requis pour désactiver le pare-feu' });
     }
   }
@@ -634,7 +702,10 @@ app.post('/api/sysaction/:name', auth, checkOrigin, async (req, res) => {
 
   const destructive = ['reboot', 'poweroff'];
   if (destructive.includes(req.params.name)) {
-    if (!checkPassword(req.body.confirm || '')) {
+    const ip = normIp(req.ip);
+    if (tooMany(ip)) return res.status(429).json({ error: 'trop de tentatives' });
+    if (!(await checkPassword(req.body.confirm || ''))) {
+      recordAttempt(ip); // B2
       return res.status(403).json({ error: 'mot de passe requis pour cette action' });
     }
   }
@@ -1023,6 +1094,10 @@ async function doAction(el, a, n) {
   } catch (e) {
     console.warn('[doAction] erreur reseau:', e);
   }
+  // B4 — réactivation explicite : updCard ne reconstruit les boutons que si
+  //      l'état online flippe, donc un restart online→online laissait le
+  //      bouton désactivé pour toujours
+  setTimeout(function(){ el.disabled = false; }, 1400);
   // P23 — setTimeout au lieu de setInterval pour éviter le chevauchement
   setTimeout(refresh, 1400);
 }
@@ -1118,7 +1193,9 @@ async function refresh() {
     if (!list) return;
     if (list.querySelector('.empty')) list.innerHTML = '';
 
+    var seen = {};
     d.processes.forEach(function(p, i) {
+      seen[p.name] = true;
       if (!KP[p.name]) {
         KP[p.name] = true;
         var card = mkCard(p);
@@ -1126,6 +1203,16 @@ async function refresh() {
         list.appendChild(card);
       } else {
         updCard(p);
+      }
+    });
+
+    // B5 — retire les cartes des process supprimés de pm2 (sinon cartes fantômes)
+    Object.keys(KP).forEach(function(name){
+      if (!seen[name]) {
+        var c = document.getElementById('card-' + name);
+        if (c) c.remove();
+        delete KP[name];
+        delete LS[name];
       }
     });
 
@@ -1274,7 +1361,7 @@ body.light .link .ic{background:rgba(0,0,0,.06)}
   <div class="st">Serveur — Actions</div>
   <div class="card">
     <div class="row">
-      <div class="grow"><div class="k">Vider le cache RAM</div><div class="sub">sync + drop_caches</div></div>
+      <div class="grow"><div class="k">Vider le cache RAM</div><div class="sub">drop_caches=3</div></div>
       <button class="abtn" onclick="sysAction('dropcache',this)">Exécuter</button>
     </div>
     <div class="row">
@@ -1432,6 +1519,10 @@ body.light .link .ic{background:rgba(0,0,0,.06)}
   </div>
 </main>
 <script>
+// B6 — échappement HTML : les valeurs injectées en innerHTML viennent de
+//      df / ps / os-release… modifiables par un process local (XSS local → admin)
+function esc(s){ return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
 // ── Réglages panel (persistés en localStorage) ──
 function lsGet(k, d){ try { var v = localStorage.getItem(k); return v === null ? d : v; } catch(e){ return d; } }
 function lsSet(k, v){ try { localStorage.setItem(k, v); } catch(e){} }
@@ -1488,8 +1579,15 @@ async function loadSysStatus(){
 async function sysToggle(service, el){
   el.disabled = true;
   var state = el.checked ? 'on' : 'off';
+  // B8 — le backend exige un mot de passe pour désactiver UFW : on le demande
+  var opts = { method:'POST' };
+  if (service === 'ufw' && state === 'off') {
+    var pw = prompt('Mot de passe requis pour désactiver le pare-feu :');
+    if (pw === null || pw === '') { el.checked = !el.checked; el.disabled = false; return; }
+    opts = { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ confirm: pw }) };
+  }
   try {
-    var r = await fetch('/api/sys/' + service + '/' + state, { method:'POST' });
+    var r = await fetch('/api/sys/' + service + '/' + state, opts);
     var d = await r.json();
     if (!r.ok) { alert(d.error || 'Échec'); el.checked = !el.checked; }
   } catch(e){ alert('Erreur réseau'); el.checked = !el.checked; }
@@ -1497,11 +1595,15 @@ async function sysToggle(service, el){
 }
 
 // ── Contrôle serveur : actions ──
-async function sysAction(name, el){
+async function sysAction(name, el, confirmPw){
   el.disabled = true;
   var old = el.textContent; el.textContent = '...';
+  // B8 — reboot/poweroff exigent le mot de passe côté serveur : on l'envoie
+  var opts = (confirmPw != null)
+    ? { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ confirm: confirmPw }) }
+    : { method:'POST' };
   try {
-    var r = await fetch('/api/sysaction/' + name, { method:'POST' });
+    var r = await fetch('/api/sysaction/' + name, opts);
     var d = await r.json();
     if (!r.ok) alert(d.error || 'Échec');
     else el.textContent = '✓';
@@ -1509,11 +1611,18 @@ async function sysAction(name, el){
   setTimeout(function(){ el.disabled = false; el.textContent = old; }, 1500);
 }
 function confirmReboot(el){
-  if (confirm('Redémarrer le serveur maintenant ? Le panel sera indisponible ~1 min.')) sysAction('reboot', el);
+  if (!confirm('Redémarrer le serveur maintenant ? Le panel sera indisponible ~1 min.')) return;
+  var pw = prompt('Mot de passe requis pour redémarrer :');
+  if (pw === null || pw === '') return;
+  sysAction('reboot', el, pw);
 }
 function confirmPoweroff(el){
   if (confirm('ÉTEINDRE le serveur ?\\n\\nIl ne pourra être rallumé que physiquement. Confirmer ?')) {
-    if (confirm('Vraiment sûr ? Cette action coupe la machine.')) sysAction('poweroff', el);
+    if (confirm('Vraiment sûr ? Cette action coupe la machine.')) {
+      var pw = prompt('Mot de passe requis pour éteindre :');
+      if (pw === null || pw === '') return;
+      sysAction('poweroff', el, pw);
+    }
   }
 }
 
@@ -1527,33 +1636,36 @@ async function loadSysInfo(){
     // Disques
     (d.disks||[]).forEach(function(dk){
       var hot = dk.pct > 85 ? ' hot' : '';
-      h += '<div class="row"><div class="grow"><div class="k">Disque ' + dk.mount + '</div>'
-        + '<div class="sub">' + dk.usedGb + ' / ' + dk.sizeGb + ' Go (' + dk.pct + '%)</div>'
-        + '<div class="bar"><i class="' + hot.trim() + '" style="width:' + dk.pct + '%"></i></div></div></div>';
+      var pct = Math.max(0, Math.min(100, parseInt(dk.pct) || 0));
+      h += '<div class="row"><div class="grow"><div class="k">Disque ' + esc(dk.mount) + '</div>'
+        + '<div class="sub">' + esc(dk.usedGb) + ' / ' + esc(dk.sizeGb) + ' Go (' + pct + '%)</div>'
+        + '<div class="bar"><i class="' + hot.trim() + '" style="width:' + pct + '%"></i></div></div></div>';
     });
     // Température
     if (d.temp != null) {
       var th = d.temp > 70 ? ' hot' : '';
+      var tv = Math.max(0, Math.min(100, parseInt(d.temp) || 0));
       h += '<div class="row"><div class="grow"><div class="k">Température CPU</div>'
-        + '<div class="sub">' + d.temp + '°C</div>'
-        + '<div class="bar"><i class="' + th.trim() + '" style="width:' + Math.min(d.temp,100) + '%"></i></div></div></div>';
+        + '<div class="sub">' + esc(d.temp) + '°C</div>'
+        + '<div class="bar"><i class="' + th.trim() + '" style="width:' + tv + '%"></i></div></div></div>';
     }
     // Swap
     if (d.swap) {
+      var sp = Math.max(0, Math.min(100, parseInt(d.swap.pct) || 0));
       h += '<div class="row"><div class="grow"><div class="k">Swap</div>'
-        + '<div class="sub">' + d.swap.usedMb + ' / ' + d.swap.totalMb + ' Mo (' + d.swap.pct + '%)</div>'
-        + '<div class="bar"><i style="width:' + d.swap.pct + '%"></i></div></div></div>';
+        + '<div class="sub">' + esc(d.swap.usedMb) + ' / ' + esc(d.swap.totalMb) + ' Mo (' + sp + '%)</div>'
+        + '<div class="bar"><i style="width:' + sp + '%"></i></div></div></div>';
     }
     // Tailscale (lecture seule)
     if (d.tailscale) {
       h += '<div class="row"><span class="k">Tailscale</span><span class="v">'
-        + (d.tailscale.up ? '🟢 ' : '🔴 ') + (d.tailscale.ip || '—') + '</span></div>';
+        + (d.tailscale.up ? '🟢 ' : '🔴 ') + esc(d.tailscale.ip || '—') + '</span></div>';
     }
     // Top process
     (d.top||[]).forEach(function(p, i){
       if (i === 0) h += '<div class="row"><span class="k" style="color:#8e8e93;font-size:10px;text-transform:uppercase">Top process</span></div>';
-      h += '<div class="row"><span class="k">' + (p.name||'') + '</span><span class="v">'
-        + p.cpu + '% cpu · ' + p.mem + '% ram</span></div>';
+      h += '<div class="row"><span class="k">' + esc(p.name||'') + '</span><span class="v">'
+        + esc(p.cpu) + '% cpu · ' + esc(p.mem) + '% ram</span></div>';
     });
     document.getElementById('sysinfo').innerHTML = h || '<div class="row"><span class="k">Aucune donnée.</span></div>';
   } catch(e){
@@ -1604,13 +1716,13 @@ async function loadLog(){
     if (d.audit && d.audit.length) {
       h += '<div class="row"><span class="k" style="color:#8e8e93;font-size:10px;text-transform:uppercase">Actions</span></div>';
       d.audit.slice(0,8).forEach(function(a){
-        h += '<div class="logrow"><span class="t">' + fmt(a.at) + '</span><span>' + a.action + '</span><span style="margin-left:auto;color:#48484a">' + a.ip + '</span></div>';
+        h += '<div class="logrow"><span class="t">' + fmt(a.at) + '</span><span>' + esc(a.action) + '</span><span style="margin-left:auto;color:#48484a">' + esc(a.ip) + '</span></div>';
       });
     }
     if (d.logins && d.logins.length) {
       h += '<div class="row"><span class="k" style="color:#8e8e93;font-size:10px;text-transform:uppercase">Connexions</span></div>';
       d.logins.slice(0,8).forEach(function(l){
-        h += '<div class="logrow"><span class="t">' + fmt(l.at) + '</span><span class="' + (l.ok?'ok':'no') + '">' + (l.ok?'réussie':'échouée') + '</span><span style="margin-left:auto;color:#48484a">' + l.ip + '</span></div>';
+        h += '<div class="logrow"><span class="t">' + fmt(l.at) + '</span><span class="' + (l.ok?'ok':'no') + '">' + (l.ok?'réussie':'échouée') + '</span><span style="margin-left:auto;color:#48484a">' + esc(l.ip) + '</span></div>';
       });
     }
     document.getElementById('logbox').innerHTML = h || '<div class="row"><span class="k">Aucune entrée.</span></div>';
@@ -1676,7 +1788,7 @@ async function loadSpecs(){
     var r = await fetch('/api/specs');
     if (r.status === 401) { location.href='/login'; return; }
     var d = await r.json();
-    function row(k, v){ return '<div class="row"><span class="k">' + k + '</span><span class="v">' + (v||'—') + '</span></div>'; }
+    function row(k, v){ return '<div class="row"><span class="k">' + k + '</span><span class="v">' + esc(v == null || v === '' ? '—' : v) + '</span></div>'; }
     var h = '';
     h += row('Serveur', d.serverName);
     h += row('Utilisateur', d.user);
@@ -1687,7 +1799,7 @@ async function loadSpecs(){
     h += row('CPU', d.cpuModel);
     h += row('Cœurs', d.cpuCores);
     h += row('RAM totale', d.ramTotalMb + ' Mo');
-    (d.ips||[]).forEach(function(n){ h += row('IP (' + n.iface + ')', n.ip); });
+    (d.ips||[]).forEach(function(n){ h += row('IP (' + esc(n.iface) + ')', n.ip); });
     h += row('Port panel', d.port);
     h += row('Node.js', d.node);
     h += row('Version panel', 'v' + d.panelVersion);
