@@ -2,8 +2,8 @@
 /*
  * ╔═══════════════════════════════════════════╗
  * ║  h0zelpanel — PM2 control panel           ║
- * ║  Made by ozitoyy001                          ║
- * ║  github.com/ozitoyy001                       ║
+ * ║  Made by ozitoyy001                       ║
+ * ║  github.com/ozitoyy001                    ║
  * ║  MIT License                              ║
  * ╚═══════════════════════════════════════════╝
  */
@@ -47,7 +47,6 @@ if (TRUST_PROXY) {
 }
 
 // ── Config utilisateur (.env) ──
-const PANEL_NAME  = 'h0zelpanel';  // hardcodé (marque du projet)
 const SERVER_NAME = process.env.SERVER_NAME || os.hostname();
 const PANEL_USER  = process.env.PANEL_USER  || (() => { try { return os.userInfo().username; } catch(e){ return 'user'; } })();
 const OS_NAME     = process.env.OS_NAME     || detectOsName();
@@ -91,6 +90,7 @@ function saveData(d) {
   scheduleSave();
   return true;
 }
+const PANEL_NAME  = 'h0zelpanel'; 
 
 function scheduleSave() {
   if (saveTimer) return;
